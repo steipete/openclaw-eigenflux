@@ -139,13 +139,13 @@ describe('register unit', () => {
       const { default: plugin } = await import('./index');
       plugin.register({
         registrationMode: 'full', config: {}, pluginConfig: {},
-        runtime: { version: '2026.7.1-2' }, version: '0.0.41',
+        runtime: { version: '2026.7.1-2' }, version: '0.0.42',
         logger: createLogger(), registerService: jest.fn(), registerCommand: jest.fn(),
         registerHook: jest.fn(), on: jest.fn(),
       } as any);
       expect(process.env.EIGENFLUX_HOST).toBe('openclaw/2026.7.1-2');
       expect(process.env.EIGENFLUX_MODE).toBe('plugin');
-      expect(process.env.EIGENFLUX_PLUGIN_VERSION).toBe('0.0.41');
+      expect(process.env.EIGENFLUX_PLUGIN_VERSION).toBe(require('../package.json').version);
     } finally {
       for (const key of keys) {
         if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key];
@@ -533,6 +533,50 @@ describe('register unit', () => {
     });
 
     await services[0].stop();
+  });
+
+  test('routes real stream order callbacks to the notifier before HTTP ACK', async () => {
+    const serverDir = path.join(eigenfluxHome, 'servers', 'eigenflux');
+    fs.mkdirSync(serverDir, { recursive: true });
+    fs.writeFileSync(path.join(serverDir, 'agent-v2-credentials.json'), JSON.stringify({ access_token: 'test-token' }));
+    discoverServersMock.mockResolvedValue({ kind: 'ok', servers: [
+      { name: 'eigenflux', endpoint: 'https://www.eigenflux.ai', current: true },
+    ] });
+    const fetchMock = jest.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true, json: async () => ({ data: { acknowledged: 1 } }),
+    } as Response);
+    const { EigenFluxNotifier } = await import('./notifier');
+    const deliver = jest.spyOn(EigenFluxNotifier.prototype, 'deliverOrder').mockResolvedValue(true);
+    const pmDeliver = jest.spyOn(EigenFluxNotifier.prototype, 'deliver').mockResolvedValue(true);
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+    plugin.register({ registrationMode: 'full', config: {}, pluginConfig: {}, runtime: {},
+      logger: createLogger(), registerService: (service: any) => services.push(service),
+      registerCommand: jest.fn(), registerHook: jest.fn(), on: jest.fn(),
+    } as any);
+    try {
+      await services[0].start();
+      deliver.mockClear();
+      const { EigenFluxStreamClient } = await import('./stream-client');
+      const callback = (EigenFluxStreamClient as jest.Mock).mock.calls[0][0].onPmEvent;
+      const notification = { notification_id: '358858910188175361', source_type: 'commission_order',
+        payload: { order_id: '358858910112677888', recipient_role: 'seller', to_state: 'pending_payment' } };
+      await callback({ type: 'notification_push', data: { notifications: [notification] } });
+      expect(deliver).toHaveBeenCalledWith(expect.stringContaining('[EIGENFLUX_ORDER_NOTIFICATION]'), expect.objectContaining({ key: 'eigenflux::358858910188175361' }));
+      expect(deliver).toHaveBeenCalledWith(expect.stringContaining('358858910112677888'), expect.any(Object));
+      expect(fetchMock).toHaveBeenCalledWith('https://www.eigenflux.ai/api/v2/notifications/ack', expect.objectContaining({ method: 'POST' }));
+      expect(deliver.mock.invocationCallOrder[0]).toBeLessThan(fetchMock.mock.invocationCallOrder[0]);
+      await callback({ type: 'commission_order_notification', notification: { ...notification, notification_id: '358858954874290177' } });
+      expect(deliver).toHaveBeenCalledTimes(2);
+      await callback({ type: 'pm_push', data: { messages: [{ msg_id: '1', content: 'hi' }] } });
+      expect(pmDeliver).toHaveBeenCalledWith(expect.stringContaining('[EIGENFLUX_MSG_PAYLOAD]'), expect.any(Object));
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      await services[0].stop();
+      fetchMock.mockRestore();
+      deliver.mockRestore();
+      pmDeliver.mockRestore();
+    }
   });
 
   test('starts feed poller and stream client for each discovered server', async () => {

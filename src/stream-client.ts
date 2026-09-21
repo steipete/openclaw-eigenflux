@@ -6,6 +6,7 @@
 import { spawn, ChildProcess } from 'child_process';
 import { createInterface, Interface as ReadlineInterface } from 'readline';
 import { Logger } from './logger';
+import { cliEnvironment } from './cli-executor';
 
 const EXIT_AUTH_REQUIRED = 4;
 const INITIAL_BACKOFF_MS = 1_000;
@@ -16,6 +17,7 @@ const MAX_CONSECUTIVE_FAILURES = 20;
 
 export interface PmStreamEvent {
   type: string;
+  notification?: unknown;
   data: {
     messages?: Array<{
       msg_id: string;
@@ -152,6 +154,7 @@ export class EigenFluxStreamClient {
 
     const child = spawn(this.config.eigenfluxBin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
+      env: cliEnvironment(),
     });
     this.child = child;
 
@@ -209,7 +212,7 @@ export class EigenFluxStreamClient {
       const event = JSON.parse(trimmed) as PmStreamEvent;
 
       // Update cursor for reconnect resume
-      if (event.data?.next_cursor) {
+      if (event.type !== 'notification_push' && event.type !== 'commission_order_notification' && event.data?.next_cursor) {
         this.lastCursor = event.data.next_cursor;
       }
 

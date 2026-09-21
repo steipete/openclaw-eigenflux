@@ -1,31 +1,33 @@
 # AGENTS.md
 
-This repository is the EigenFlux OpenClaw plugin. The repo root *is* the plugin root, so `openclaw.plugin.json`, `package.json`, and the OpenClaw plugin manifest all live here directly.
+Read [Skill maintenance instructions](skills/AGENTS.md) before changing Skills integration or plugin prompts.
 
-### OpenClaw Plugin (Polling)
+This repository is the EigenFlux OpenClaw plugin. The repository root contains `openclaw.plugin.json`, `package.json`, and the plugin entry points.
 
-The plugin polls the EigenFlux API for updates, without relying on a server-side push channel.
+## Responsibility boundary
 
-**Polling Method**:
-- Periodically calls `GET /api/v1/items/feed?action=refresh&limit=20`
-- Reads `<workdir>/credentials.json` for each configured server
-- If a server token is missing, expired, or the feed returns `401`, guides the agent to complete registration or login for that server
-- Forwards the complete feed JSON payload to the agent through the layered notifier:
-  `runtime.subagent` -> Gateway `agent` RPC -> `openclaw agent` CLI -> system-event heartbeat fallbacks
-- Injects `network`, `workdir`, and `skill_file` into prompts
-- Lifts the feed response's `output_contract` into a leading prose block (the binding output rules), stripping it from the echoed payload. Falls back to the CLI-synced `~/.agents/skills/ef-broadcast/references/contract.md`, then an inline constant, when an older server omits the field
-- Syncs signed Skills from R2 into OpenClaw's user-level `~/.agents/skills` directory on startup and daily; the plugin package contains no embedded Skills
-- Resolves `skill_file` from `<workdir>/skill.md` first, then `<endpoint>/skill.md`
-- Supports multiple servers under `plugins.entries.<id>.config.servers`
-- Detects OpenClaw session stores automatically from the local state directories
-- Registers `/eigenflux auth|profile|servers|feed|pm|here` auto-reply commands
-- Registers one polling service per enabled server; no OpenClaw hooks are registered in the current implementation
+Keep business decisions in the central EigenFlux CLI and dynamically synchronized Skills. Let the CLI own authentication and capability classification, onboarding behavior, due-time decisions, action selection, output contracts, and persistent business state. Keep plugin prompts limited to host context, dynamic instruction references, and delivery facts. Do not copy business rules into prompts, tool descriptions, inline fallbacks, or timers. Migrate a business workflow only after its central CLI entry point and output contract are available and tested.
 
-**Testing**:
-- Recommended validation commands:
-  - `pnpm build`
-  - `pnpm test`
+Keep OpenClaw service registration, process lifecycle, host context extraction, Skills snapshot refresh, session routing, lane isolation, delivery, and transport backpressure in this repository. Do not build a plugin-specific onboarding or permission state machine.
 
-**Maintenance**:
-- When bumping the OpenClaw plugin version, run `pnpm bump-version <version>` to sync `package.json`, `openclaw.plugin.json`, and the runtime plugin version constant together.
-- The Claude Code plugin for EigenFlux lives in a separate repo: https://github.com/phronesis-io/eigenflux-claude-plugin
+## Runtime integration
+
+- Send trusted current-model metadata through the CLI as `X-Client-Model`; persist and read `model`, without `model_name` aliases or default-configuration inference.
+
+- Discover configured servers through the CLI and preserve the stable Agent Home and explicit server on every operation.
+- Request `heartbeat plan --format json` on each poll. Validate `schema_version`, `agent_prompt`, and `wake_on_empty`; pass the prompt through and use the returned delivery decision.
+- Call `feed poll` once per cycle and attach its payload to the Agent turn. Preserve server `output_contract` text, use the current CLI-synced contract when the field is absent, and retain no embedded contract copy.
+- Sync signed Skills through the CLI at startup. Each heartbeat plan refreshes compatible Skills; refresh the OpenClaw Skills snapshot after a valid plan.
+- Drive `profile refresh-task --format agent` from the existing heartbeat, passing host memory paths and extracted session snippets. Deliver nonempty stdout through the normal Agent route; let the current Skills select visible output or NO_REPLY. Let the CLI decide eligibility, cadence, and follow-up work.
+- Keep PM streaming and feedback flush adapters thin. Let the CLI own remote requests, queue validation, batching, and deduplication.
+- Register `/eigenflux auth|profile|refresh|servers|feed|pm|here|version` as host command adapters.
+
+## Validation
+
+Run `pnpm build` and `pnpm test`. Cover central instruction pass-through, missing or invalid central output, quiet skips, and host lifecycle behavior without invoking live EigenFlux services.
+
+## Maintenance
+
+When releasing a plugin version, run `pnpm bump-version <version>` to synchronize package, manifest, and runtime versions. Pure central Skill changes do not require a plugin release.
+
+The Claude Code plugin lives in https://github.com/phronesis-io/eigenflux-claude-plugin.

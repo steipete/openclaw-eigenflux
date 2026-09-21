@@ -4,7 +4,22 @@ import { Logger } from './logger';
 export interface HeartbeatPlanRunnerConfig {
   eigenfluxBin: string;
   eigenfluxHome: string;
+  serverName: string;
   logger: Logger;
+}
+
+export interface HeartbeatExecutionPlan {
+  schema_version: 'eigenflux_heartbeat_plan.v1';
+  agent_prompt: string;
+  wake_on_empty: boolean;
+}
+
+function isHeartbeatExecutionPlan(value: unknown): value is HeartbeatExecutionPlan {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const plan = value as Record<string, unknown>;
+  return plan.schema_version === 'eigenflux_heartbeat_plan.v1' &&
+    typeof plan.agent_prompt === 'string' && plan.agent_prompt.trim().length > 0 &&
+    typeof plan.wake_on_empty === 'boolean';
 }
 
 export class EigenFluxHeartbeatPlanRunner {
@@ -12,13 +27,8 @@ export class EigenFluxHeartbeatPlanRunner {
 
   constructor(private readonly config: HeartbeatPlanRunnerConfig) {}
 
-  /**
-   * Return the verified plan for delivery to the Agent. Running the command for
-   * its compatibility side effect alone is insufficient: the Agent must read
-   * the plan to execute Commands → Feed → Attention → Communication → Publish
-   * → Settings.
-   */
-  async run(): Promise<string | null> {
+  /** Fetch the current CLI instructions and delivery decision for this server. */
+  async run(): Promise<HeartbeatExecutionPlan | null> {
     if (this.inFlight) {
       this.config.logger.debug('Heartbeat plan skipped because a run is already in flight');
       return null;
@@ -26,24 +36,26 @@ export class EigenFluxHeartbeatPlanRunner {
 
     this.inFlight = true;
     try {
-      const result = await execEigenflux<string>(
+      const result = await execEigenflux<unknown>(
         this.config.eigenfluxBin,
         [
           '--homedir',
           this.config.eigenfluxHome,
+          '--server',
+          this.config.serverName,
           'heartbeat',
           'plan',
           '--format',
-          'agent',
+          'json',
         ],
-        { logger: this.config.logger, parseJson: false }
+        { logger: this.config.logger }
       );
 
       if (result.kind === 'success') {
-        if (typeof result.data === 'string' && result.data.trim()) {
+        if (isHeartbeatExecutionPlan(result.data)) {
           return result.data;
         }
-        this.config.logger.warn('Heartbeat plan returned no Agent instructions');
+        this.config.logger.warn('Heartbeat plan returned an invalid execution contract; update the EigenFlux CLI');
         return null;
       }
       if (result.kind === 'auth_required') {

@@ -3,60 +3,40 @@ import { EigenFluxHeartbeatPlanRunner } from './heartbeat-plan-runner';
 import { Logger } from './logger';
 
 jest.mock('./cli-executor');
-
 const execMock = execEigenflux as jest.MockedFunction<typeof execEigenflux>;
-const loggerSpies = {
-  debug: jest.fn(),
-  info: jest.fn(),
-  warn: jest.fn(),
-  error: jest.fn(),
-};
-const logger = new Logger(loggerSpies);
+const logger = new Logger({ debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() });
+const config = { eigenfluxBin: '/opt/eigenflux', eigenfluxHome: '/stable/home', serverName: 'alpha', logger };
+const plan = { schema_version: 'eigenflux_heartbeat_plan.v1', agent_prompt: 'CENTRAL PLAN', wake_on_empty: false };
 
-describe('EigenFluxHeartbeatPlanRunner', () => {
-  beforeEach(() => {
-    jest.clearAllMocks();
-  });
+beforeEach(() => execMock.mockReset());
 
-  test('runs the thin plan with the stable home', async () => {
-    execMock.mockResolvedValue({ kind: 'success', data: 'plan' });
-    const runner = new EigenFluxHeartbeatPlanRunner({
-      eigenfluxBin: '/opt/eigenflux',
-      eigenfluxHome: '/stable/openclaw/.eigenflux',
-      logger,
-    });
+test('loads the structured plan for the stable Home and explicit server', async () => {
+  execMock.mockResolvedValue({ kind: 'success', data: plan });
+  await expect(new EigenFluxHeartbeatPlanRunner(config).run()).resolves.toEqual(plan);
+  expect(execMock).toHaveBeenCalledWith('/opt/eigenflux', [
+    '--homedir', '/stable/home', '--server', 'alpha', 'heartbeat', 'plan', '--format', 'json',
+  ], { logger });
+});
 
-    await expect(runner.run()).resolves.toBe('plan');
-    expect(execMock).toHaveBeenCalledWith(
-      '/opt/eigenflux',
-      [
-        '--homedir',
-        '/stable/openclaw/.eigenflux',
-        'heartbeat',
-        'plan',
-        '--format',
-        'agent',
-      ],
-      { logger, parseJson: false }
-    );
-  });
+test.each([
+  'free-form old plan', null, {},
+  { ...plan, schema_version: 'unknown' },
+  { ...plan, agent_prompt: '' },
+  { ...plan, agent_prompt: 42 },
+  { ...plan, wake_on_empty: undefined },
+  { ...plan, wake_on_empty: 'false' },
+])('rejects an invalid central execution contract: %j', async (data) => {
+  execMock.mockResolvedValue({ kind: 'success', data });
+  await expect(new EigenFluxHeartbeatPlanRunner(config).run()).resolves.toBeNull();
+});
 
-  test('keeps the existing heartbeat alive when the plan fails', async () => {
-    execMock.mockResolvedValue({
-      kind: 'error',
-      error: new Error('offline'),
-      exitCode: 1,
-      stderr: 'offline',
-    });
-    const runner = new EigenFluxHeartbeatPlanRunner({
-      eigenfluxBin: 'eigenflux',
-      eigenfluxHome: '/stable/home',
-      logger,
-    });
+test('accepts the central completed-mode delivery choice without inspecting prompt wording', async () => {
+  const completed = { ...plan, wake_on_empty: true, agent_prompt: 'baseline mentioned as historical context' };
+  execMock.mockResolvedValue({ kind: 'success', data: completed });
+  await expect(new EigenFluxHeartbeatPlanRunner(config).run()).resolves.toEqual(completed);
+});
 
-    await expect(runner.run()).resolves.toBeNull();
-    expect(loggerSpies.warn).toHaveBeenCalledWith(
-      expect.stringContaining('Heartbeat plan failed: offline')
-    );
-  });
+test('plan failure returns no replacement business instructions', async () => {
+  execMock.mockResolvedValue({ kind: 'error', error: new Error('offline'), exitCode: 2, stderr: 'offline' });
+  await expect(new EigenFluxHeartbeatPlanRunner(config).run()).resolves.toBeNull();
 });

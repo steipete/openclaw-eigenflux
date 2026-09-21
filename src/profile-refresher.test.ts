@@ -1,408 +1,167 @@
-import { EigenFluxProfileRefresher, msUntilNextRefresh } from './profile-refresher';
+import { EigenFluxProfileRefresher, type ProfileRefresherConfig } from './profile-refresher';
 import { Logger } from './logger';
-import type { CliResult } from './cli-executor';
-
-jest.mock('./cli-executor');
-
 import { execEigenflux } from './cli-executor';
 
+jest.mock('./cli-executor');
 const execMock = execEigenflux as jest.MockedFunction<typeof execEigenflux>;
+const context = { memoryDirs: ['/host/memory'], sessionSnippets: ['Host conversation context'] };
 
-function createLoggerSpies() {
-  return { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
-}
-
-function createLogger(spies = createLoggerSpies()): Logger {
-  return new Logger(spies);
-}
-
-// Host-specific inputs the OpenClaw adapter hands to the CLI core.
-const CTX = {
-  memoryDirs: ['/state/workspace/memory'],
-  sessionSnippets: ['Working on operator fusion memory peaks in Halcyon'],
-};
-
-// The prompt the CLI core (`profile refresh-prompt`) prints to stdout.
-const CLI_PROMPT = 'ASSEMBLED PROMPT for TestBot\n## From your memory\n...';
-
-describe('msUntilNextRefresh', () => {
-  test('targets 1:00-4:59 AM window', () => {
-    for (let i = 0; i < 50; i++) {
-      const now = new Date(2026, 4, 27, 10, 0, 0); // 10:00 AM
-      const delay = msUntilNextRefresh(now);
-      const target = new Date(now.getTime() + delay);
-      expect(target.getHours()).toBeGreaterThanOrEqual(1);
-      expect(target.getHours()).toBeLessThan(5);
-      expect(delay).toBeGreaterThan(0);
-    }
-  });
-
-  test('targets tomorrow when past 5:00 AM', () => {
-    const now = new Date(2026, 4, 27, 10, 0, 0);
-    const delay = msUntilNextRefresh(now);
-    const target = new Date(now.getTime() + delay);
-    expect(target.getDate()).toBe(28);
-  });
-
-  test('targets today when before 1:00 AM', () => {
-    const now = new Date(2026, 4, 27, 0, 15, 0);
-    const delay = msUntilNextRefresh(now);
-    const target = new Date(now.getTime() + delay);
-    expect(target.getDate()).toBe(27);
-    expect(target.getHours()).toBeGreaterThanOrEqual(1);
-  });
-});
-
-function makeRefresher(overrides: Record<string, unknown> = {}) {
-  return new EigenFluxProfileRefresher({
-    serverName: 'eigenflux',
-    eigenfluxBin: 'eigenflux',
-    logger: createLogger(),
+function setup(overrides: Partial<ProfileRefresherConfig> = {}) {
+  const logger = new Logger({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() });
+  const config: ProfileRefresherConfig = {
+    serverName: 'alpha', eigenfluxBin: '/bin/eigenflux', logger,
+    collectContext: () => context,
     onRefreshPrompt: jest.fn().mockResolvedValue(undefined),
     onAuthRequired: jest.fn().mockResolvedValue(undefined),
-    collectContext: () => CTX,
     ...overrides,
-  } as any);
+  };
+  return { config, adapter: new EigenFluxProfileRefresher(config) };
 }
 
-const telemetry = (spies: ReturnType<typeof createLoggerSpies>) => {
-  const marker = 'profile_refresh_telemetry ';
-  const line = spies.info.mock.calls.map((c) => String(c[0])).find((m) => m.includes(marker));
-  return line ? JSON.parse(line.slice(line.indexOf(marker) + marker.length)) : undefined;
-};
+beforeEach(() => execMock.mockReset());
 
-const statusTelemetry = (spies: ReturnType<typeof createLoggerSpies>) => {
-  const marker = 'status_broadcast_telemetry ';
-  const line = spies.info.mock.calls.map((c) => String(c[0])).find((m) => m.includes(marker));
-  return line ? JSON.parse(line.slice(line.indexOf(marker) + marker.length)) : undefined;
-};
-
-describe('EigenFluxProfileRefresher', () => {
-  beforeEach(() => {
-    jest.useFakeTimers();
-    execMock.mockReset();
-  });
-
-  afterEach(() => {
-    jest.useRealTimers();
-    jest.restoreAllMocks();
-  });
-
-  test('calls `profile refresh-prompt` with memory-dir + session-snippet and delivers stdout', async () => {
-    const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
-    execMock.mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>);
-
-    const refresher = makeRefresher({ eigenfluxBin: '/usr/bin/eigenflux', onRefreshPrompt });
-    refresher.start();
-    jest.advanceTimersByTime(24 * 60 * 60 * 1000);
-    for (let i = 0; i < 12; i++) await Promise.resolve();
-
-    expect(execMock).toHaveBeenCalledWith(
-      '/usr/bin/eigenflux',
-      [
-        'profile', 'refresh-prompt', '-s', 'eigenflux',
-        '--memory-dir', '/state/workspace/memory',
-        '--session-snippet', 'Working on operator fusion memory peaks in Halcyon',
-      ],
-      expect.objectContaining({ parseJson: false }),
-    );
-    expect(onRefreshPrompt).toHaveBeenCalledTimes(1);
-    expect(onRefreshPrompt.mock.calls[0][0]).toBe(CLI_PROMPT);
-
-    refresher.stop();
-  });
-
-  test('fires onTick (daily side task, e.g. skills sync) once per daily cadence', async () => {
-    const onTick = jest.fn().mockResolvedValue(undefined);
-    execMock.mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>);
-
-    const refresher = makeRefresher({ onTick });
-    refresher.start();
-    jest.advanceTimersByTime(24 * 60 * 60 * 1000);
-    for (let i = 0; i < 12; i++) await Promise.resolve();
-
-    expect(onTick).toHaveBeenCalledTimes(1);
-    refresher.stop();
-  });
-
-  test('a throwing onTick never breaks the refresh loop (best-effort, keeps rescheduling)', async () => {
-    const onTick = jest.fn().mockRejectedValue(new Error('boom'));
-    execMock.mockResolvedValue({ kind: 'success', data: CLI_PROMPT } as CliResult<any>);
-
-    const refresher = makeRefresher({ onTick });
-    refresher.start();
-    jest.advanceTimersByTime(24 * 60 * 60 * 1000);
-    for (let i = 0; i < 12; i++) await Promise.resolve();
-    expect(onTick).toHaveBeenCalledTimes(1);
-
-    // The loop must have rescheduled despite onTick throwing.
-    jest.advanceTimersByTime(24 * 60 * 60 * 1000);
-    for (let i = 0; i < 12; i++) await Promise.resolve();
-    expect(onTick).toHaveBeenCalledTimes(2);
-
-    refresher.stop();
-  });
-
-  test('emits delivered telemetry with memory_dirs/session counts', async () => {
-    const spies = createLoggerSpies();
-    execMock.mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>);
-
-    const refresher = makeRefresher({ logger: createLogger(spies) });
-    refresher.start();
-    jest.advanceTimersByTime(24 * 60 * 60 * 1000);
-    for (let i = 0; i < 12; i++) await Promise.resolve();
-
-    expect(telemetry(spies)).toMatchObject({
-      server: 'eigenflux',
-      outcome: 'delivered',
-      memory_dirs: 1,
-      session_snippets: 1,
-      delivered: true,
-    });
-
-    refresher.stop();
-  });
-
-  test('skips with skipped_no_context and does NOT call the CLI when there is no context', async () => {
-    const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
-    const spies = createLoggerSpies();
-
-    const refresher = makeRefresher({
-      logger: createLogger(spies),
-      onRefreshPrompt,
-      collectContext: () => ({ memoryDirs: [], sessionSnippets: [] }),
-    });
-    refresher.start();
-    jest.advanceTimersByTime(24 * 60 * 60 * 1000);
-    for (let i = 0; i < 12; i++) await Promise.resolve();
-
-    expect(execMock).not.toHaveBeenCalled();
-    expect(onRefreshPrompt).not.toHaveBeenCalled();
-    expect(telemetry(spies)).toMatchObject({ outcome: 'skipped_no_context' });
-
-    refresher.stop();
-  });
-
-  test('skips when the CLI prints an empty prompt', async () => {
-    const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
-    const spies = createLoggerSpies();
-    execMock.mockResolvedValueOnce({ kind: 'success', data: '   ' } as CliResult<any>);
-
-    const refresher = makeRefresher({ logger: createLogger(spies), onRefreshPrompt });
-    refresher.start();
-    jest.advanceTimersByTime(24 * 60 * 60 * 1000);
-    for (let i = 0; i < 12; i++) await Promise.resolve();
-
-    expect(onRefreshPrompt).not.toHaveBeenCalled();
-    expect(telemetry(spies)).toMatchObject({ outcome: 'skipped_no_context' });
-
-    refresher.stop();
-  });
-
-  test('triggers onAuthRequired when the CLI reports auth_required', async () => {
-    const onAuthRequired = jest.fn().mockResolvedValue(undefined);
-    execMock.mockResolvedValueOnce({ kind: 'auth_required', stderr: '' } as CliResult<any>);
-
-    const refresher = makeRefresher({ onAuthRequired });
-    refresher.start();
-    jest.advanceTimersByTime(24 * 60 * 60 * 1000);
-    for (let i = 0; i < 12; i++) await Promise.resolve();
-
-    expect(onAuthRequired).toHaveBeenCalled();
-    refresher.stop();
-  });
-
-  test('triggerNow delivers immediately, even when never started', async () => {
-    const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
-    execMock.mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>);
-
-    const refresher = makeRefresher({ onRefreshPrompt });
-    // No start() — running stays false.
-    await refresher.triggerNow();
-
-    expect(refresher.isRunning()).toBe(false);
-    expect(onRefreshPrompt).toHaveBeenCalledTimes(1);
-    expect(onRefreshPrompt.mock.calls[0][0]).toBe(CLI_PROMPT);
-  });
-
-  test('isRunning returns false after stop', () => {
-    const refresher = makeRefresher();
-    expect(refresher.isRunning()).toBe(false);
-    refresher.start();
-    expect(refresher.isRunning()).toBe(true);
-    refresher.stop();
-    expect(refresher.isRunning()).toBe(false);
-  });
-
-  test('stop clears pending timer', () => {
-    const refresher = makeRefresher();
-    refresher.start();
-    refresher.stop();
-    jest.advanceTimersByTime(24 * 60 * 60 * 1000);
-    expect(execMock).not.toHaveBeenCalled();
-  });
+test('heartbeat passes host context to the CLI and delivers its task verbatim', async () => {
+  const { config, adapter } = setup();
+  execMock.mockResolvedValue({ kind: 'success', data: 'CENTRAL TASK: read current Skills' });
+  adapter.start();
+  await adapter.tick();
+  expect(execMock).toHaveBeenCalledWith('/bin/eigenflux', [
+    'profile', 'refresh-task', '-s', 'alpha', '--format', 'agent',
+    '--memory-dir', '/host/memory', '--session-snippet', 'Host conversation context',
+  ], { logger: config.logger, parseJson: false });
+  expect(config.onRefreshPrompt).toHaveBeenCalledWith('CENTRAL TASK: read current Skills');
+  expect(execMock).toHaveBeenCalledTimes(1);
 });
 
-// The status-broadcast prompt the CLI core (`profile status-prompt`) prints.
-const STATUS_PROMPT = 'STATUS BROADCAST PROMPT\n## What to broadcast\n...';
-
-describe('EigenFluxProfileRefresher daily status broadcast', () => {
-  beforeEach(() => {
-    execMock.mockReset();
-  });
-  afterEach(() => {
-    jest.restoreAllMocks();
-  });
-
-  // triggerNow avoids fake timers: a deterministic bio-refresh → status chain.
-  function primeBioThenStatus() {
-    execMock
-      .mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>) // refresh-prompt
-      .mockResolvedValueOnce({ kind: 'success', data: STATUS_PROMPT } as CliResult<any>); // status-prompt
-  }
-
-  test('auto branch: recurring_publish on → status-prompt --auto-publish true, delivered silently', async () => {
-    primeBioThenStatus();
-    const onStatusPrompt = jest.fn().mockResolvedValue(undefined);
-    const refresher = makeRefresher({
-      readRecurringPublish: jest.fn().mockResolvedValue(true),
-      onStatusPrompt,
-    });
-
-    await refresher.triggerNow();
-
-    expect(execMock).toHaveBeenNthCalledWith(
-      2,
-      'eigenflux',
-      [
-        'profile', 'status-prompt', '-s', 'eigenflux', '--auto-publish=true',
-        '--memory-dir', '/state/workspace/memory',
-        '--session-snippet', 'Working on operator fusion memory peaks in Halcyon',
-      ],
-      expect.objectContaining({ parseJson: false }),
-    );
-    expect(onStatusPrompt).toHaveBeenCalledWith(STATUS_PROMPT, { silent: true });
-  });
-
-  test('confirm branch: recurring_publish off → --auto-publish false, delivered non-silent', async () => {
-    primeBioThenStatus();
-    const onStatusPrompt = jest.fn().mockResolvedValue(undefined);
-    const refresher = makeRefresher({
-      readRecurringPublish: jest.fn().mockResolvedValue(false),
-      onStatusPrompt,
-    });
-
-    await refresher.triggerNow();
-
-    // Single-arg equals form — never `'--auto-publish', 'false'` (space form
-    // would be coerced to true by cobra, flipping OFF into auto-publish).
-    expect(execMock.mock.calls[1][1]).toContain('--auto-publish=false');
-    expect(execMock.mock.calls[1][1]).not.toContain('--auto-publish');
-    expect(onStatusPrompt).toHaveBeenCalledWith(STATUS_PROMPT, { silent: false });
-  });
-
-  test('empty status-prompt stdout → skip, no delivery', async () => {
-    execMock
-      .mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>)
-      .mockResolvedValueOnce({ kind: 'success', data: '   ' } as CliResult<any>);
-    const onStatusPrompt = jest.fn().mockResolvedValue(undefined);
-    const refresher = makeRefresher({
-      readRecurringPublish: jest.fn().mockResolvedValue(true),
-      onStatusPrompt,
-    });
-
-    await refresher.triggerNow();
-    expect(onStatusPrompt).not.toHaveBeenCalled();
-  });
-
-  test('status step is skipped when callbacks are unwired (no second exec)', async () => {
-    execMock.mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>);
-    const refresher = makeRefresher(); // no readRecurringPublish/onStatusPrompt
-
-    await refresher.triggerNow();
-    expect(execMock).toHaveBeenCalledTimes(1);
-  });
-
-  test('a failing status step never throws and never blocks the bio result', async () => {
-    execMock
-      .mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>)
-      .mockResolvedValueOnce({ kind: 'error', error: new Error('boom'), exitCode: 1, stderr: '' } as CliResult<any>);
-    const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
-    const onStatusPrompt = jest.fn().mockResolvedValue(undefined);
-    const refresher = makeRefresher({
-      onRefreshPrompt,
-      readRecurringPublish: jest.fn().mockResolvedValue(true),
-      onStatusPrompt,
-    });
-
-    await expect(refresher.triggerNow()).resolves.toBeUndefined();
-    expect(onRefreshPrompt).toHaveBeenCalledTimes(1); // bio still delivered
-    expect(onStatusPrompt).not.toHaveBeenCalled();
-  });
-
-  test('status broadcast is not attempted when the bio delivery fails', async () => {
-    execMock.mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>);
-    const onStatusPrompt = jest.fn().mockResolvedValue(undefined);
-    const readRecurringPublish = jest.fn().mockResolvedValue(true);
-    const refresher = makeRefresher({
-      onRefreshPrompt: jest.fn().mockRejectedValue(new Error('deliver failed')),
-      readRecurringPublish,
-      onStatusPrompt,
-    });
-
-    await refresher.triggerNow();
-    expect(readRecurringPublish).not.toHaveBeenCalled();
-    expect(onStatusPrompt).not.toHaveBeenCalled();
-    expect(execMock).toHaveBeenCalledTimes(1); // no status-prompt call
-  });
-
-  test('status-prompt auth_required → onAuthRequired + telemetry, no delivery', async () => {
-    const spies = createLoggerSpies();
-    execMock
-      .mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>)
-      .mockResolvedValueOnce({ kind: 'auth_required', stderr: '' } as CliResult<any>);
-    const onStatusPrompt = jest.fn().mockResolvedValue(undefined);
-    const onAuthRequired = jest.fn().mockResolvedValue(undefined);
-    const refresher = makeRefresher({
-      logger: createLogger(spies),
-      readRecurringPublish: jest.fn().mockResolvedValue(true),
-      onStatusPrompt,
-      onAuthRequired,
-    });
-
-    await refresher.triggerNow();
-    expect(onAuthRequired).toHaveBeenCalledTimes(1);
-    expect(onStatusPrompt).not.toHaveBeenCalled();
-    expect(statusTelemetry(spies)?.outcome).toBe('auth_required');
-  });
-
-  test('fail-closed: readRecurringPublish throwing defaults to draft-and-confirm (auto=false)', async () => {
-    primeBioThenStatus();
-    const onStatusPrompt = jest.fn().mockResolvedValue(undefined);
-    const refresher = makeRefresher({
-      readRecurringPublish: jest.fn().mockRejectedValue(new Error('config unreadable')),
-      onStatusPrompt,
-    });
-
-    await refresher.triggerNow();
-    // Unreadable setting must NOT auto-publish: falls back to non-silent confirm.
-    expect(execMock.mock.calls[1][1]).toContain('--auto-publish=false');
-    expect(onStatusPrompt).toHaveBeenCalledWith(STATUS_PROMPT, { silent: false });
-  });
-
-  test('onStatusPrompt failure is observable: emits delivery_failed telemetry, never throws', async () => {
-    const spies = createLoggerSpies();
-    primeBioThenStatus();
-    const refresher = makeRefresher({
-      logger: createLogger(spies),
-      readRecurringPublish: jest.fn().mockResolvedValue(true),
-      onStatusPrompt: jest.fn().mockRejectedValue(new Error('channel down')),
-    });
-
-    await expect(refresher.triggerNow()).resolves.toBeUndefined();
-    const t = statusTelemetry(spies);
-    expect(t?.outcome).toBe('delivery_failed');
-    expect(t?.delivered).toBe(false);
-  });
+test('CLI empty output is a quiet skip, with no status-prompt chain', async () => {
+  const { config, adapter } = setup();
+  execMock.mockResolvedValue({ kind: 'success', data: '' });
+  adapter.start();
+  await adapter.tick();
+  expect(config.onRefreshPrompt).not.toHaveBeenCalled();
+  expect(config.onAuthRequired).not.toHaveBeenCalled();
+  expect(execMock).toHaveBeenCalledTimes(1);
 });
 
+test('every host tick asks the CLI without a plugin due-time cache', async () => {
+  const { config, adapter } = setup();
+  execMock.mockResolvedValueOnce({ kind: 'success', data: '' });
+  execMock.mockResolvedValueOnce({ kind: 'success', data: 'NOW DUE' });
+  adapter.start();
+  await adapter.tick();
+  await adapter.tick();
+  expect(execMock).toHaveBeenCalledTimes(2);
+  expect(config.onRefreshPrompt).toHaveBeenCalledWith('NOW DUE');
+});
+
+test('explicit manual refresh forces the central task even while the background adapter is stopped', async () => {
+  const { config, adapter } = setup();
+  execMock.mockResolvedValue({ kind: 'success', data: 'TASK' });
+  await adapter.tick();
+  expect(execMock).not.toHaveBeenCalled();
+  await adapter.triggerNow();
+  expect(execMock).toHaveBeenCalledTimes(1);
+  expect(execMock.mock.calls[0][1]).toEqual([
+    'profile', 'refresh-task', '-s', 'alpha', '--format', 'agent', '--force',
+    '--memory-dir', '/host/memory', '--session-snippet', 'Host conversation context',
+  ]);
+  expect(config.onRefreshPrompt).toHaveBeenCalledWith('TASK');
+});
+
+test('concurrent heartbeats share one request and one delivery', async () => {
+  let resolveRequest!: (value: any) => void;
+  execMock.mockReturnValue(new Promise((resolve) => { resolveRequest = resolve; }));
+  const { config, adapter } = setup();
+  adapter.start();
+  const first = adapter.tick();
+  const second = adapter.tick();
+  await Promise.resolve();
+  resolveRequest({ kind: 'success', data: 'TASK' });
+  await Promise.all([first, second]);
+  expect(execMock).toHaveBeenCalledTimes(1);
+  expect(config.onRefreshPrompt).toHaveBeenCalledTimes(1);
+});
+
+test.each(['skip', 'error'])('manual requests queue one force after an in-flight background %s', async (outcome) => {
+  let finishBackground!: (value: any) => void;
+  execMock.mockReturnValueOnce(new Promise((resolve) => { finishBackground = resolve; }));
+  execMock.mockResolvedValueOnce({ kind: 'success', data: 'FORCED TASK' });
+  const { config, adapter } = setup();
+  adapter.start();
+  const background = adapter.tick();
+  const firstManual = adapter.triggerNow();
+  const secondManual = adapter.triggerNow();
+  await Promise.resolve();
+  expect(execMock).toHaveBeenCalledTimes(1);
+  expect(execMock.mock.calls[0][1]).not.toContain('--force');
+  finishBackground(outcome === 'skip'
+    ? { kind: 'success', data: '' }
+    : { kind: 'error', error: new Error('unavailable'), exitCode: 1, stderr: 'unavailable' });
+  await Promise.all([background, firstManual, secondManual]);
+  expect(execMock).toHaveBeenCalledTimes(2);
+  expect(execMock.mock.calls[1][1]).toContain('--force');
+  expect(config.onRefreshPrompt).toHaveBeenCalledTimes(1);
+  expect(config.onRefreshPrompt).toHaveBeenCalledWith('FORCED TASK');
+});
+
+test('manual requests and heartbeats share an in-flight forced task', async () => {
+  let finishRequest!: (value: any) => void;
+  execMock.mockReturnValueOnce(new Promise((resolve) => { finishRequest = resolve; }));
+  const { config, adapter } = setup();
+  adapter.start();
+  const firstManual = adapter.triggerNow();
+  const background = adapter.tick();
+  const secondManual = adapter.triggerNow();
+  await Promise.resolve();
+  finishRequest({ kind: 'success', data: 'FORCED TASK' });
+  await Promise.all([firstManual, background, secondManual]);
+  expect(execMock).toHaveBeenCalledTimes(1);
+  expect(execMock.mock.calls[0][1]).toContain('--force');
+  expect(config.onRefreshPrompt).toHaveBeenCalledTimes(1);
+});
+
+test('stopping during a CLI request suppresses late background delivery', async () => {
+  let resolveRequest!: (value: any) => void;
+  execMock.mockReturnValue(new Promise((resolve) => { resolveRequest = resolve; }));
+  const { config, adapter } = setup();
+  adapter.start();
+  const pending = adapter.tick();
+  await Promise.resolve();
+  adapter.stop();
+  resolveRequest({ kind: 'success', data: 'TASK' });
+  await pending;
+  expect(config.onRefreshPrompt).not.toHaveBeenCalled();
+});
+
+test('missing host context is passed to the CLI for its decision', async () => {
+  const { adapter } = setup({ collectContext: undefined });
+  execMock.mockResolvedValue({ kind: 'success', data: '' });
+  adapter.start();
+  await adapter.tick();
+  expect(execMock.mock.calls[0][1]).toEqual([
+    'profile', 'refresh-task', '-s', 'alpha', '--format', 'agent',
+  ]);
+});
+
+test.each(['auth_required', 'error', 'not_installed'] as const)('%s does not interrupt the heartbeat', async (kind) => {
+  const { config, adapter } = setup();
+  execMock.mockResolvedValue(kind === 'auth_required'
+    ? { kind, stderr: 'expired' }
+    : kind === 'not_installed' ? { kind, bin: '/bin/eigenflux' }
+      : { kind, error: new Error('scope unavailable'), exitCode: 2, stderr: 'scope unavailable' });
+  adapter.start();
+  await expect(adapter.tick()).resolves.toBeUndefined();
+  expect(config.onRefreshPrompt).not.toHaveBeenCalled();
+  expect(config.onAuthRequired).toHaveBeenCalledTimes(kind === 'auth_required' ? 1 : 0);
+});
+
+test('context collection and delivery errors stay within the host adapter', async () => {
+  const { adapter } = setup({
+    collectContext: async () => { throw new Error('host unavailable'); },
+    onRefreshPrompt: async () => { throw new Error('host unavailable'); },
+  });
+  execMock.mockResolvedValue({ kind: 'success', data: 'TASK' });
+  adapter.start();
+  await expect(adapter.tick()).resolves.toBeUndefined();
+  expect(execMock).toHaveBeenCalledTimes(1);
+});

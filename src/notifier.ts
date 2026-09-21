@@ -1,4 +1,5 @@
-import { randomUUID } from 'node:crypto';
+import type { OrderDeliveryReceipt } from './order-notifications';
+import { createHash, randomUUID } from 'node:crypto';
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk/plugin-entry';
 import { type NotificationRouteOverrides } from './config';
 import { Logger } from './logger';
@@ -223,6 +224,43 @@ export class EigenFluxNotifier {
 
   private get runtime(): EigenFluxRuntimeApi {
     return (this.api.runtime ?? {}) as EigenFluxRuntimeApi;
+  }
+
+  /** Order delivery has one durable host run. Never fall back after submission. */
+  async deliverOrder(message: string, context: {
+    key: string;
+    receipt: OrderDeliveryReceipt;
+    checkpoint: (receipt: OrderDeliveryReceipt) => void;
+  }): Promise<boolean> {
+    const { receipt, checkpoint } = context;
+    if (receipt.status === 'delivered') return true;
+    if (receipt.status === 'failed' || (receipt.status === 'submitting' && !receipt.runId)) return false;
+    const subagent = this.runtime.subagent;
+    if (!subagent?.run || !subagent.waitForRun) return false;
+    let runId = receipt.runId;
+    if (!runId) {
+      const digest = createHash('sha256').update(context.key).digest('hex');
+      const base = await this.resolveRoute();
+      const route = { ...base.route, sessionKey: `agent:${base.route.agentId}:eigenflux:order:${digest}` };
+      await this.seedOneShotDeliveryContext(route.sessionKey, route);
+      checkpoint({ status: 'submitting' });
+      // A thrown call can still have been accepted remotely. The submitting
+      // receipt deliberately prevents automatic replay in that ambiguous case.
+      const submitted = await subagent.run({ sessionKey: route.sessionKey, message,
+        deliver: true, idempotencyKey: `eigenflux-order-${digest}`, lane: 'eigenflux-order' });
+      if (!submitted.runId) throw new Error('Order run acceptance missing runId');
+      runId = submitted.runId;
+      checkpoint({ status: 'running', runId });
+    }
+    // A timeout / unavailable wait endpoint leaves the same run in progress.
+    // No cancellation, CLI fallback, new session, or new run is permitted.
+    const result = await subagent.waitForRun({ runId, timeoutMs: 1000 });
+    if (result.status === 'error') {
+      checkpoint({ status: 'failed', runId });
+      this.logger.warn(`Order run requires reconciliation: run_id=${runId}`);
+      return false;
+    }
+    return result.status === 'ok';
   }
 
   async deliver(message: string, options?: DeliverOptions): Promise<boolean> {

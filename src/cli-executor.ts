@@ -18,12 +18,19 @@ export interface ExecOptions {
   timeout?: number;
   cwd?: string;
   logger?: Logger;
+  /** Per-child metadata overrides; never mutate the Gateway environment. */
+  env?: NodeJS.ProcessEnv;
   /**
    * When false, stdout is returned as a raw string instead of being parsed as
    * JSON. Useful for CLI commands whose stdout is a human-readable status line
    * (e.g. `eigenflux config set`). Defaults to true.
    */
   parseJson?: boolean;
+}
+
+/** The Gateway serves multiple Agents; model identity must be scoped per call. */
+export function cliEnvironment(overrides?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...process.env, EIGENFLUX_MODEL: undefined, ...overrides };
 }
 
 export function execEigenflux<T>(
@@ -44,6 +51,7 @@ export function execEigenflux<T>(
         timeout,
         maxBuffer: 10 * 1024 * 1024,
         encoding: 'utf-8',
+        env: cliEnvironment(options?.env),
         ...(options?.cwd ? { cwd: options.cwd } : {}),
       },
       (error, stdout, stderr) => {

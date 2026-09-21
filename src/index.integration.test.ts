@@ -78,6 +78,8 @@ function waitFor(condition: () => boolean, timeoutMs = 8000): Promise<void> {
 describe('register integration', () => {
   let homeDir: string;
   let eigenfluxHome: string;
+  let wakeOnEmpty: boolean;
+  let profileTask: string;
 
   let feedItems: Array<{
     item_id: string;
@@ -88,6 +90,8 @@ describe('register integration', () => {
 
   beforeEach(async () => {
     streamClientConfig = undefined;
+    wakeOnEmpty = true;
+    profileTask = '';
     homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eigenflux-openclaw-home-'));
     eigenfluxHome = path.join(homeDir, '.eigenflux');
     __testHomeDir = homeDir;
@@ -113,8 +117,8 @@ describe('register integration', () => {
 
     // Set up execEigenflux to return feed data
     execEigenfluxMock.mockImplementation(async (bin: string, args: string[]) => {
-      if (args[0] === '--homedir' && args[2] === 'heartbeat' && args[3] === 'plan') {
-        return { kind: 'success', data: 'EIGENFLUX HEARTBEAT PLAN\nCommands → Feed → Attention' };
+      if (args[0] === '--homedir' && args[4] === 'heartbeat' && args[5] === 'plan') {
+        return { kind: 'success', data: { schema_version: 'eigenflux_heartbeat_plan.v1', agent_prompt: 'EIGENFLUX HEARTBEAT PLAN\nCommands → Feed → Attention', wake_on_empty: wakeOnEmpty } };
       }
       if (args[0] === 'feed' && args[1] === 'poll') {
         return {
@@ -123,8 +127,12 @@ describe('register integration', () => {
             items: feedItems,
             has_more: false,
             notifications: [],
+            output_contract: 'OUTPUT CONTRACT supplied by CLI: follow the current Skills. 📡 Powered by EigenFlux',
           },
         };
+      }
+      if (args[0] === 'profile' && args[1] === 'refresh-task') {
+        return { kind: 'success', data: profileTask };
       }
       if (args[0] === 'config' && args[1] === 'get') {
         return { kind: 'success', data: undefined };
@@ -145,6 +153,45 @@ describe('register integration', () => {
     __testHomeDir = undefined;
     delete process.env.EIGENFLUX_FEED_DELIVERY;
     fs.rmSync(homeDir, { recursive: true, force: true });
+  });
+
+  test.each([false, true])('empty Feed follows CLI wake_on_empty=%s while background adapters continue', async (wake) => {
+    wakeOnEmpty = wake;
+    feedItems = [];
+    jest.resetModules();
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+    const subagentRun = jest.fn().mockResolvedValue({ runId: 'empty-feed-run' });
+    plugin.register({
+      registrationMode: 'full', config: {}, pluginConfig: {},
+      runtime: { subagent: { run: subagentRun } },
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      registerService: (service: any) => services.push(service),
+    } as any);
+    await services[0].start();
+    expect(subagentRun).toHaveBeenCalledTimes(wake ? 1 : 0);
+    expect(execEigenfluxMock.mock.calls.some(([, args]) => args[0] === 'profile' && args[1] === 'refresh-task')).toBe(true);
+    await services[0].stop();
+  });
+
+  test('central profile tasks keep the host reply route available for Skill-selected drafts', async () => {
+    wakeOnEmpty = false;
+    feedItems = [];
+    profileTask = 'EIGENFLUX PROFILE REVIEW TASK\nFollow the current Skills.';
+    jest.resetModules();
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+    const subagentRun = jest.fn().mockResolvedValue({ runId: 'profile-task-run' });
+    plugin.register({
+      registrationMode: 'full', config: {}, pluginConfig: {},
+      runtime: { subagent: { run: subagentRun } },
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      registerService: (service: any) => services.push(service),
+    } as any);
+    await services[0].start();
+    expect(subagentRun).toHaveBeenCalledTimes(1);
+    expect(subagentRun.mock.calls[0][0]).toMatchObject({ message: profileTask, deliver: true });
+    await services[0].stop();
   });
 
   test('routes feed notifications via runtime.subagent when available', async () => {
@@ -177,7 +224,7 @@ describe('register integration', () => {
       message: expect.stringContaining('[EIGENFLUX_HEARTBEAT]'),
       deliver: true,
       idempotencyKey: expect.any(String),
-      lane: 'eigenflux-bg',
+      lane: 'subagent',
     });
     const message = String(subagentRun.mock.calls[0]?.[0]?.message);
     expect(message).toContain('Commands → Feed → Attention');
@@ -223,7 +270,7 @@ describe('register integration', () => {
     // session — NOT a throwaway one-shot key, and NOT via system-event enqueue.
     const params = subagentRun.mock.calls[0][0];
     expect(params.deliver).toBe(true);
-    expect(params.lane).toBe('eigenflux-bg');
+    expect(params.lane).toBe('subagent');
     expect(params.sessionKey).not.toMatch(/^eigenflux:feed:/);
     expect(String(params.message)).toContain('[EIGENFLUX_FEED_PAYLOAD]');
     expect(enqueueSystemEvent).not.toHaveBeenCalled();
@@ -313,7 +360,8 @@ describe('register integration', () => {
     expect(params.sessionKey).not.toBe('agent:main:main');
     expect(params.lane).toMatch(/^eigenflux-pm:[a-f0-9]{16}:[a-f0-9]{16}:[a-f0-9]{16}$/);
     expect(params.message).toContain('"conv_id": "conv-341466745984253952"');
-    expect(params.message).toContain('eigenflux msg history --conv-id <conv_id> --limit 20');
+    expect(params.message).toContain('ef-communication skill');
+    expect(params.message).not.toContain('eigenflux msg history');
     expect(params.message).toContain('stable isolated session');
 
     await services[0].stop();

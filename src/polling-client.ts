@@ -107,6 +107,8 @@ export interface FeedResponse {
 export interface PollingClientConfig {
   serverName: string;
   eigenfluxBin: string;
+  /** Actual model observed for this runtime; absent until ownership is verified. */
+  resolveModel?: () => string | undefined;
   /**
    * Resolves the seconds to wait before the next poll. Invoked after every
    * poll completes so the interval can be changed at runtime via the
@@ -254,7 +256,7 @@ export class EigenFluxPollingClient {
         const result = await execEigenflux<FeedResponseData>(
           this.config.eigenfluxBin,
           ['feed', 'poll', '--limit', '20', '--action', 'refresh', '-s', this.config.serverName, '-f', 'json'],
-          { logger: this.config.logger }
+          { logger: this.config.logger, env: { EIGENFLUX_MODEL: this.config.resolveModel?.() } }
         );
 
         if (result.kind === 'auth_required') {

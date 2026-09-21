@@ -1,5 +1,5 @@
 /**
- * OpenClaw adapter for the host-agnostic `eigenflux profile refresh-prompt`
+ * OpenClaw adapter for the host-agnostic `eigenflux profile refresh-task`
  * core. The CLI owns prompt assembly + memory reading; this module supplies the
  * two host-specific inputs:
  *   - memoryDirs: where OpenClaw keeps memory markdown (CLI reads the files).
@@ -162,7 +162,7 @@ function extractTurnText(line: string): string | undefined {
   if (!text) return undefined;
 
   // Drop EigenFlux system payloads and bare sentinels — they are noise here.
-  if (/EIGENFLUX_FEED_PAYLOAD|profile is due for|EigenFlux feed payload/i.test(text)) return undefined;
+  if (/EIGENFLUX_FEED_PAYLOAD|EIGENFLUX PROFILE REVIEW TASK|profile is due for|EigenFlux feed payload/i.test(text)) return undefined;
   if (/^(NO_REPLY|HEARTBEAT_OK|Triggered a silent profile refresh)/.test(text)) return undefined;
 
   const oneLine = text.replace(/\s+/g, ' ');

@@ -10,7 +10,7 @@
  * issuing a V1/V2 settings PUT when metadata changes or the daily report is due.
  * It uses
  * its own credentials/base-URL. The plugin therefore stays thin — it only
- * supplies the runtime `mode` (which is only knowable at runtime) and triggers
+ * supplies runtime metadata observed by the host and triggers
  * the CLI once per poll cycle.
  *
  * Reporting is best-effort: any CLI failure is logged at warn/debug level and
@@ -47,10 +47,23 @@ export class EigenFluxSettingsReporter {
   private readonly config: SettingsReporterConfig;
   private readonly resolveMode: () => AgentMode | undefined;
   private inFlight = false;
+  private observedModel?: string;
 
   constructor(config: SettingsReporterConfig) {
     this.config = config;
     this.resolveMode = config.resolveMode ?? (() => resolveAgentMode());
+  }
+
+  /** Only host events attributed to this runtime may update its model. */
+  observeModel(model: string): void {
+    const value = model.trim();
+    if (value && Buffer.byteLength(value, 'utf8') <= 128 && !/[\u0000-\u001f\u007f]/.test(value)) {
+      this.observedModel = value;
+    }
+  }
+
+  getObservedModel(): string | undefined {
+    return this.observedModel;
   }
 
   /**
@@ -78,9 +91,12 @@ export class EigenFluxSettingsReporter {
         );
       }
 
+      if (this.observedModel) args.push('--model', this.observedModel);
+
       const result = await execEigenflux<string>(this.config.eigenfluxBin, args, {
         logger: this.config.logger,
         parseJson: false,
+        env: { EIGENFLUX_MODEL: undefined },
       });
 
       if (result.kind === 'success') {

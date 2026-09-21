@@ -72,22 +72,37 @@ describe('agent prompt templates', () => {
     expect(prompt).toContain('[EIGENFLUX_FEED_PAYLOAD]');
   });
 
-  test('feed payload prompt inlines the output contract so it binds without loading the skill', () => {
-    const prompt = buildFeedPayloadPromptTemplate(
-      {
-        code: 0,
-        msg: 'ok',
-        data: { items: [], has_more: false, notifications: [] },
-      },
+  test('missing central contract keeps the payload and current Skill reference without inventing rules', () => {
+    const root = mkdtempSync(join(tmpdir(), 'eigenflux-claw-missing-skills-'));
+    const previous = process.env.EIGENFLUX_SKILLS_DIR;
+    process.env.EIGENFLUX_SKILLS_DIR = root;
+    try {
+      const prompt = buildFeedPayloadPromptTemplate(
+        { code: 0, msg: 'ok', data: { items: [{ item_id: '17', broadcast_type: 'info', updated_at: 1 }], has_more: false, notifications: [] } },
+        context
+      );
+      expect(prompt).toContain('ef-broadcast skill');
+      expect(prompt).toContain('"item_id": "17"');
+      expect(prompt).not.toContain('OUTPUT CONTRACT');
+      expect(prompt).not.toContain('Submit feedback');
+    } finally {
+      if (previous === undefined) delete process.env.EIGENFLUX_SKILLS_DIR;
+      else process.env.EIGENFLUX_SKILLS_DIR = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('preserves a baseline plan without appending a complete-operation stage list', () => {
+    const plan = 'CENTRAL PLAN: consume baseline Feed; skip unavailable stages.';
+    const prompt = buildHeartbeatExecutionPromptTemplate(
+      plan,
+      { code: 0, msg: 'ok', data: { items: [], has_more: false, notifications: [], output_contract: '' } },
       context
     );
-
-    // Hard rules must be present in the prompt itself, ahead of the payload.
-    expect(prompt).toContain('OUTPUT CONTRACT');
-    expect(prompt).toContain('📡 Powered by EigenFlux');
-    expect(prompt).toContain('feed_delivery_preference');
-    expect(prompt).toContain('impersonation');
-    expect(prompt.indexOf('OUTPUT CONTRACT')).toBeLessThan(prompt.indexOf('Payload:'));
+    expect(prompt).toContain(plan);
+    expect(prompt).toContain('do not run another feed poll');
+    expect(prompt).not.toContain('Complete Attention');
+    expect(prompt).not.toContain('Run Commands first');
   });
 
   test('reads the fallback contract from the CLI-synced host Skills directory', () => {
@@ -104,6 +119,13 @@ describe('agent prompt templates', () => {
         context
       );
       expect(prompt).toContain('SYNCED HOST CONTRACT');
+      writeFileSync(join(contractDir, 'contract.md'), 'UPDATED CENTRAL CONTRACT');
+      const updated = buildFeedPayloadPromptTemplate(
+        { code: 0, msg: 'ok', data: { items: [], has_more: false, notifications: [] } },
+        context
+      );
+      expect(updated).toContain('UPDATED CENTRAL CONTRACT');
+      expect(updated).not.toContain('SYNCED HOST CONTRACT');
     } finally {
       if (previous === undefined) delete process.env.EIGENFLUX_SKILLS_DIR;
       else process.env.EIGENFLUX_SKILLS_DIR = previous;
