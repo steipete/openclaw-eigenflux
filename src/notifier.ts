@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
+import type { OpenClawPluginApi } from 'openclaw/plugin-sdk/plugin-entry';
 import { type NotificationRouteOverrides } from './config';
 import { Logger } from './logger';
 import {
@@ -23,6 +23,21 @@ type SessionStoreEntryLike = {
   lastTo?: string;
   lastAccountId?: string;
   [key: string]: unknown;
+};
+
+type SessionStoreReadParams = {
+  agentId?: string;
+  sessionKey: string;
+  storePath?: string;
+};
+
+type TaskRunLike = {
+  id: string;
+  runId?: string;
+  status?: string;
+  createdAt?: number;
+  startedAt?: number;
+  endedAt?: number;
 };
 
 type EigenFluxRuntimeApi = {
@@ -53,11 +68,10 @@ type EigenFluxRuntimeApi = {
       resolveStorePath?: (store: string | undefined, opts?: { agentId?: string }) => string;
       /** Row-scoped read: one session entry by agent/session identity. Used by
        *  the busy check to see how recently the main conversation was active. */
-      getSessionEntry?: (params: {
-        agentId?: string;
-        sessionKey: string;
-        storePath?: string;
-      }) => SessionStoreEntryLike | undefined;
+      getSessionEntryAsync?: (
+        params: SessionStoreReadParams
+      ) => Promise<SessionStoreEntryLike | undefined>;
+      getSessionEntry?: (params: SessionStoreReadParams) => SessionStoreEntryLike | undefined;
       /** Row-scoped write: patch a single session entry by identity. Replaces the
        *  deprecated whole-store `updateSessionStore` (SQLite-migration guard
        *  `sdk-session-store-write`). Merges the returned partial into the entry. */
@@ -78,19 +92,13 @@ type EigenFluxRuntimeApi = {
     async?: {
       runs: {
         bindSession: (params: { sessionKey: string }) => {
-          list: () => Promise<Array<{
-            id: string;
-            runId?: string;
-            status?: string;
-            createdAt?: number;
-            startedAt?: number;
-            endedAt?: number;
-          }>>;
+          list: () => Promise<TaskRunLike[]>;
         };
       };
     };
     runs?: {
       bindSession?: (params: { sessionKey: string }) => {
+        list: () => TaskRunLike[];
         cancel: (params: { taskId: string; cfg: unknown }) => Promise<{
           found: boolean;
           cancelled: boolean;
@@ -646,15 +654,17 @@ export class EigenFluxNotifier {
   /** Best-effort true cancellation after either queue or execution timeout. */
   private async tryCancelRun(sessionKey: string, runId: string): Promise<boolean> {
     const runs = this.runtime.tasks?.runs;
-    const reads = this.runtime.tasks?.async?.runs;
-    if (!reads || !runs || typeof runs.bindSession !== 'function') {
+    const asyncTasks = this.runtime.tasks?.async;
+    if (!runs || typeof runs.bindSession !== 'function') {
       this.logger.debug(
-        `tryCancelRun: async task reads or cancellation unavailable; cannot cancel run_id=${runId}`
+        `tryCancelRun: runtime.tasks.runs unavailable; cannot cancel run_id=${runId}`
       );
       return false;
     }
     try {
-      const tasks = await reads.bindSession({ sessionKey }).list();
+      const tasks = asyncTasks
+        ? await asyncTasks.runs.bindSession({ sessionKey }).list()
+        : runs.bindSession({ sessionKey }).list();
       const task = tasks.find((t) => t.runId === runId);
       if (!task) {
         this.logger.warn(
@@ -884,8 +894,9 @@ export class EigenFluxNotifier {
       return false;
     }
 
-    const runs = this.runtime.tasks?.async?.runs;
-    if (runs) {
+    const tasksRuntime = this.runtime.tasks;
+    const runs = tasksRuntime?.async ? tasksRuntime.async.runs : tasksRuntime?.runs;
+    if (runs && typeof runs.bindSession === 'function') {
       try {
         // list() returns the session's FULL task history, terminal records
         // included — only a task without endedAt is actually running.
@@ -900,12 +911,15 @@ export class EigenFluxNotifier {
     }
 
     const session = this.runtime.agent?.session;
-    if (typeof session?.getSessionEntry === 'function') {
+    if (session) {
       try {
-        const entry = session.getSessionEntry({
+        const params = {
           agentId: route.agentId,
           sessionKey: route.sessionKey,
-        });
+        };
+        const entry = typeof session.getSessionEntryAsync === 'function'
+          ? await session.getSessionEntryAsync(params)
+          : session.getSessionEntry?.(params);
         const updatedAt = typeof entry?.updatedAt === 'number' ? entry.updatedAt : undefined;
         if (updatedAt !== undefined && Date.now() - updatedAt < recentActivityMs) {
           return true;
