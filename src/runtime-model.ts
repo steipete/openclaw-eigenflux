@@ -1,4 +1,4 @@
-import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
+import type { OpenClawPluginApi } from 'openclaw/plugin-sdk/plugin-entry';
 import type { RoutingConfig } from './config';
 import type { Logger } from './logger';
 
